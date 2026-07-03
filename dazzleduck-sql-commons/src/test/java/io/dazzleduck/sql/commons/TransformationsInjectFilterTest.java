@@ -12,9 +12,11 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -258,6 +260,58 @@ public class TransformationsInjectFilterTest {
         String out = Transformations.parseToSql(conn, result);
         List<Object> ids = execFirstColumn(out);
         assertEquals(4, ids.size(), "UNION ALL: 2 rows × 2 arms");
+    }
+
+    // --- set operation nested inside a derived table (regression: RLS bypass) ---
+
+    @Test
+    void unionInsideDerivedTable_filterInjectedIntoBothArms() throws SQLException, JsonProcessingException {
+        // Regression: a UNION nested inside a FROM-subquery (derived table). Previously the SUBQUERY
+        // branch of renameBaseTablesInFromNode dispatched a set-operation body to the SELECT-only
+        // handler, so base tables inside the UNION were never wrapped — an RLS bypass that leaked
+        // every row. They must now be filtered.
+        String sql = "SELECT id FROM ("
+                + "SELECT id, tenant_id FROM orders WHERE amount > 0 "
+                + "UNION ALL "
+                + "SELECT id, tenant_id FROM orders WHERE amount < 1000) sub";
+        JsonNode tree = Transformations.parseToTree(conn, sql);
+        JsonNode result = Transformations.injectFilterCtes(tree, filter("tenant_id = 'abc'"));
+        String out = Transformations.parseToSql(conn, result);
+
+        assertTrue(out.contains("___orders"), "orders inside the nested UNION must get a filter CTE");
+        List<Object> ids = execFirstColumn(out);
+        // Each arm filtered to tenant abc {1,3}; UNION ALL → 4 rows, all abc.
+        assertEquals(4, ids.size(), "both arms return only tenant abc rows: " + ids);
+        assertTrue(ids.stream().allMatch(v -> v.equals(1) || v.equals(3)),
+                "tenant xyz (id 2) must not leak: " + ids);
+    }
+
+    // --- lateral VALUES unpivot (single-scan distinct-values pattern) ---
+
+    @Test
+    void lateralValuesUnpivot_filterInjected() throws SQLException, JsonProcessingException {
+        // Mirrors the single-scan distinct-values query: the fact table is scanned once and each row
+        // is unpivoted into (column, value) tuples via a lateral VALUES list. The base table must
+        // still be filtered, and only authorized rows' values may appear.
+        String sql = "SELECT DISTINCT v.col, v.val FROM orders, (VALUES "
+                + "('id', CAST(id AS VARCHAR)), "
+                + "('amount', CAST(amount AS VARCHAR))"
+                + ") AS v(col, val) WHERE v.val IS NOT NULL";
+        JsonNode tree = Transformations.parseToTree(conn, sql);
+        JsonNode result = Transformations.injectFilterCtes(tree, filter("tenant_id = 'abc'"));
+        String out = Transformations.parseToSql(conn, result);
+
+        assertTrue(out.contains("___orders"), "orders must get a filter CTE in the lateral-VALUES query");
+
+        Set<String> pairs = new HashSet<>();
+        try (ResultSet rs = conn.createStatement().executeQuery(out)) {
+            while (rs.next()) {
+                pairs.add(rs.getString(1) + ":" + rs.getString(2));
+            }
+        }
+        // tenant abc rows: (id 1, amount 100), (id 3, amount 300). xyz (id 2 / amount 200) excluded.
+        assertEquals(Set.of("id:1", "id:3", "amount:100", "amount:300"), pairs,
+                "only tenant abc values may appear: " + pairs);
     }
 
     // --- per-table map with fully-qualified keys (security tests) ---

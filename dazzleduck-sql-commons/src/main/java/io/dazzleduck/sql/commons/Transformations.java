@@ -1434,8 +1434,12 @@ public class Transformations {
                 walkExpressionsForSubqueries(fromNode.get("condition"), userCteNames, tablesToWrap);
             }
             case NODE_TYPE_SUBQUERY -> {
-                ObjectNode innerSelect = (ObjectNode) fromNode.get(FIELD_SUBQUERY).get(FIELD_NODE);
-                renameBaseTablesInSelect(innerSelect, userCteNames, tablesToWrap);
+                // The derived-table body may be a SELECT or a set operation (UNION/INTERSECT/EXCEPT);
+                // dispatch on its type so base tables inside a UNION are filtered too. Calling
+                // renameBaseTablesInSelect directly would silently skip a set-operation body, letting
+                // its base tables pass through UNFILTERED (an RLS bypass).
+                ObjectNode inner = (ObjectNode) fromNode.get(FIELD_SUBQUERY).get(FIELD_NODE);
+                renameBaseTablesInStatementNode(inner, userCteNames, tablesToWrap);
             }
             case NODE_TYPE_SET_OPERATION_NODE -> {
                 renameBaseTablesInFromNode(fromNode.get(FIELD_LEFT), userCteNames, tablesToWrap);
