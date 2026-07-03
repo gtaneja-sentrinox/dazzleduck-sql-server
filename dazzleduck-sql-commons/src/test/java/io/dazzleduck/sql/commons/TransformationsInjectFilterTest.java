@@ -12,9 +12,11 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -260,6 +262,58 @@ public class TransformationsInjectFilterTest {
         assertEquals(4, ids.size(), "UNION ALL: 2 rows × 2 arms");
     }
 
+    // --- set operation nested inside a derived table (regression: RLS bypass) ---
+
+    @Test
+    void unionInsideDerivedTable_filterInjectedIntoBothArms() throws SQLException, JsonProcessingException {
+        // Regression: a UNION nested inside a FROM-subquery (derived table). Previously the SUBQUERY
+        // branch of renameBaseTablesInFromNode dispatched a set-operation body to the SELECT-only
+        // handler, so base tables inside the UNION were never wrapped — an RLS bypass that leaked
+        // every row. They must now be filtered.
+        String sql = "SELECT id FROM ("
+                + "SELECT id, tenant_id FROM orders WHERE amount > 0 "
+                + "UNION ALL "
+                + "SELECT id, tenant_id FROM orders WHERE amount < 1000) sub";
+        JsonNode tree = Transformations.parseToTree(conn, sql);
+        JsonNode result = Transformations.injectFilterCtes(tree, filter("tenant_id = 'abc'"));
+        String out = Transformations.parseToSql(conn, result);
+
+        assertTrue(out.contains("___orders"), "orders inside the nested UNION must get a filter CTE");
+        List<Object> ids = execFirstColumn(out);
+        // Each arm filtered to tenant abc {1,3}; UNION ALL → 4 rows, all abc.
+        assertEquals(4, ids.size(), "both arms return only tenant abc rows: " + ids);
+        assertTrue(ids.stream().allMatch(v -> v.equals(1) || v.equals(3)),
+                "tenant xyz (id 2) must not leak: " + ids);
+    }
+
+    // --- lateral VALUES unpivot (single-scan distinct-values pattern) ---
+
+    @Test
+    void lateralValuesUnpivot_filterInjected() throws SQLException, JsonProcessingException {
+        // Mirrors the single-scan distinct-values query: the fact table is scanned once and each row
+        // is unpivoted into (column, value) tuples via a lateral VALUES list. The base table must
+        // still be filtered, and only authorized rows' values may appear.
+        String sql = "SELECT DISTINCT v.col, v.val FROM orders, (VALUES "
+                + "('id', CAST(id AS VARCHAR)), "
+                + "('amount', CAST(amount AS VARCHAR))"
+                + ") AS v(col, val) WHERE v.val IS NOT NULL";
+        JsonNode tree = Transformations.parseToTree(conn, sql);
+        JsonNode result = Transformations.injectFilterCtes(tree, filter("tenant_id = 'abc'"));
+        String out = Transformations.parseToSql(conn, result);
+
+        assertTrue(out.contains("___orders"), "orders must get a filter CTE in the lateral-VALUES query");
+
+        Set<String> pairs = new HashSet<>();
+        try (ResultSet rs = conn.createStatement().executeQuery(out)) {
+            while (rs.next()) {
+                pairs.add(rs.getString(1) + ":" + rs.getString(2));
+            }
+        }
+        // tenant abc rows: (id 1, amount 100), (id 3, amount 300). xyz (id 2 / amount 200) excluded.
+        assertEquals(Set.of("id:1", "id:3", "amount:100", "amount:300"), pairs,
+                "only tenant abc values may appear: " + pairs);
+    }
+
     // --- per-table map with fully-qualified keys (security tests) ---
 
     @Test
@@ -360,5 +414,132 @@ public class TransformationsInjectFilterTest {
         // Must only see abc rows (1, 3), not xyz row (2) — filter must not be bypassed
         assertEquals(List.of(1, 3), ids,
                 "CTE name shadowing the authorized table must not bypass the row filter");
+    }
+
+    // --- fail-open node-type gaps in the filter-injection traversal (RLS-bypass regressions) ---
+
+    private List<Object> sorted(List<Object> in) {
+        List<Object> copy = new ArrayList<>(in);
+        copy.sort((a, b) -> ((Comparable) a).compareTo(b));
+        return copy;
+    }
+
+    @Test
+    void recursiveCte_topLevel_filterInjectedIntoAnchor() throws SQLException, JsonProcessingException {
+        // Regression: a WITH RECURSIVE body serializes as RECURSIVE_CTE_NODE, a type the statement
+        // dispatcher previously ignored — the anchor's base table passed through UNFILTERED.
+        // The recursive term (WHERE false) adds no rows, so r is exactly the filtered anchor.
+        String sql = "WITH RECURSIVE r(id) AS ("
+                + "SELECT id FROM orders "
+                + "UNION ALL "
+                + "SELECT id FROM r WHERE false) "
+                + "SELECT id FROM r";
+        JsonNode tree = Transformations.parseToTree(conn, sql);
+        JsonNode result = Transformations.injectFilterCtes(tree, filter("tenant_id = 'abc'"));
+        String out = Transformations.parseToSql(conn, result);
+
+        assertTrue(out.contains("___orders"), "recursive CTE anchor must get a filter CTE: " + out);
+        assertEquals(List.of(1, 3), sorted(execFirstColumn(out)),
+                "only tenant abc rows may seed the recursion; xyz (id 2) must not leak");
+    }
+
+    @Test
+    void recursiveCte_nestedInDerivedTable_filterInjected() throws SQLException, JsonProcessingException {
+        String sql = "SELECT id FROM (WITH RECURSIVE r(id) AS ("
+                + "SELECT id FROM orders UNION ALL SELECT id FROM r WHERE false) "
+                + "SELECT id FROM r) sub";
+        JsonNode tree = Transformations.parseToTree(conn, sql);
+        JsonNode result = Transformations.injectFilterCtes(tree, filter("tenant_id = 'abc'"));
+        String out = Transformations.parseToSql(conn, result);
+
+        assertTrue(out.contains("___orders"), "recursive CTE inside a derived table must be filtered: " + out);
+        assertEquals(List.of(1, 3), sorted(execFirstColumn(out)), "xyz (id 2) must not leak");
+    }
+
+    @Test
+    void nestedWithInsideDerivedTable_filterInjected() throws SQLException, JsonProcessingException {
+        // Regression: renameBaseTablesInSelect did not walk a derived-table body's own WITH clause,
+        // so orders inside the inner CTE leaked and the inner CTE name got mis-wrapped (broken SQL).
+        String sql = "SELECT id FROM (WITH s AS (SELECT id, tenant_id FROM orders) SELECT id FROM s) sub";
+        JsonNode tree = Transformations.parseToTree(conn, sql);
+        JsonNode result = Transformations.injectFilterCtes(tree, filter("tenant_id = 'abc'"));
+        String out = Transformations.parseToSql(conn, result);
+
+        assertTrue(out.contains("___orders"), "orders inside the nested WITH must be filtered: " + out);
+        assertFalse(out.contains("___s"), "the inner CTE name must not be wrapped as a phantom base table: " + out);
+        assertEquals(List.of(1, 3), sorted(execFirstColumn(out)), "xyz (id 2) must not leak");
+    }
+
+    @Test
+    void unpivot_filterInjected() throws SQLException, JsonProcessingException {
+        // Regression: a PIVOT/UNPIVOT FROM node was not handled, so the base table under `source`
+        // was never wrapped. tenant_id is the kept (non-unpivoted) column; only abc must survive.
+        String sql = "SELECT tenant_id FROM orders UNPIVOT (val FOR col IN (id, amount))";
+        JsonNode tree = Transformations.parseToTree(conn, sql);
+        JsonNode result = Transformations.injectFilterCtes(tree, filter("tenant_id = 'abc'"));
+        String out = Transformations.parseToSql(conn, result);
+
+        assertTrue(out.contains("___orders"), "unpivoted base table must get a filter CTE: " + out);
+        List<Object> tenants = execFirstColumn(out);
+        assertTrue(tenants.stream().allMatch(t -> t.equals("abc")),
+                "only tenant abc rows may appear after unpivot: " + tenants);
+        assertEquals(4, tenants.size(), "2 abc rows × 2 unpivoted columns");
+    }
+
+    @Test
+    void valuesListScalarSubquery_filterInjected() throws SQLException, JsonProcessingException {
+        // Regression: an EXPRESSION_LIST (VALUES) FROM node's value expressions were never walked,
+        // so a scalar subquery over a base table inside VALUES bypassed the filter.
+        String sql = "SELECT x FROM (VALUES ((SELECT sum(amount) FROM orders))) v(x)";
+        JsonNode tree = Transformations.parseToTree(conn, sql);
+        JsonNode result = Transformations.injectFilterCtes(tree, filter("tenant_id = 'abc'"));
+        String out = Transformations.parseToSql(conn, result);
+
+        assertTrue(out.contains("___orders"), "scalar subquery over orders in VALUES must be filtered: " + out);
+        List<Object> vals = execFirstColumn(out);
+        assertEquals("400", String.valueOf(vals.get(0)),
+                "filtered sum is 100+300=400 (all-tenant 600 would mean the filter was bypassed): " + vals);
+    }
+
+    @Test
+    void orderByScalarSubquery_filterInjected() throws SQLException, JsonProcessingException {
+        // Regression: ORDER BY subqueries live under modifiers[].orders[].expression, not a top-level
+        // "order_bys" field the code used to read (always null) — so they were never filtered.
+        String sql = "SELECT order_id FROM items ORDER BY (SELECT max(amount) FROM orders)";
+        JsonNode tree = Transformations.parseToTree(conn, sql);
+        JsonNode result = Transformations.injectFilterCtes(tree, filter("tenant_id = 'abc'"));
+        String out = Transformations.parseToSql(conn, result);
+
+        assertTrue(out.contains("___orders"),
+                "orders referenced only in an ORDER BY subquery must still be filtered: " + out);
+    }
+
+    @Test
+    void setOperationOrderBySubquery_filterInjected() throws SQLException, JsonProcessingException {
+        // Regression: the set-operation branch never walked the union's own ORDER BY/LIMIT modifiers,
+        // so a base table referenced only there bypassed the filter. orders appears ONLY in ORDER BY.
+        String sql = "SELECT x FROM ("
+                + "SELECT order_id AS x FROM items "
+                + "UNION ALL "
+                + "SELECT order_id AS x FROM items "
+                + "ORDER BY (SELECT max(amount) FROM orders)) s";
+        JsonNode tree = Transformations.parseToTree(conn, sql);
+        JsonNode result = Transformations.injectFilterCtes(tree, filter("tenant_id = 'abc'"));
+        String out = Transformations.parseToSql(conn, result);
+
+        assertTrue(out.contains("___orders"),
+                "orders referenced only in a UNION's ORDER BY subquery must still be filtered: " + out);
+    }
+
+    @Test
+    void unsupportedFromNode_failsClosed() throws SQLException, JsonProcessingException {
+        // A FROM node type the traversal does not recognize (here a table function) must ABORT rather
+        // than silently pass base tables through unfiltered. RESTRICT_READ_ONLY blocks table functions
+        // upstream; this guards the injector's own fail-closed contract regardless of caller.
+        String sql = "SELECT * FROM generate_series(1, 3)";
+        JsonNode tree = Transformations.parseToTree(conn, sql);
+        assertThrows(IllegalStateException.class,
+                () -> Transformations.injectFilterCtes(tree, filter("tenant_id = 'abc'")),
+                "an unhandled FROM node type must fail closed, not produce an unfiltered query");
     }
 }
