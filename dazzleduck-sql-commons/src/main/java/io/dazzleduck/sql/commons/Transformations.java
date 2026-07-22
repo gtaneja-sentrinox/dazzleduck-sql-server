@@ -939,9 +939,20 @@ public class Transformations {
         }
     }
 
-    /** True if {@code fromRef}'s table name matches a CTE declared in {@code selectNode}'s WITH clause. */
+    /**
+     * True if {@code fromRef} can resolve to a CTE declared in {@code selectNode}'s WITH clause.
+     * A schema- or catalog-qualified reference ({@code s3.fv}) always resolves to the catalog and
+     * can never hit a CTE, so it returns false regardless of CTE names.
+     */
     private static boolean referencesOuterCte(JsonNode selectNode, JsonNode fromRef) {
-        String name = asText(fromRef, FIELD_TABLE_NAME);
+        String schema = asText(fromRef, FIELD_SCHEMA_NAME);
+        String catalog = asText(fromRef, FIELD_CATALOG_NAME);
+        if ((schema != null && !schema.isEmpty()) || (catalog != null && !catalog.isEmpty())) return false;
+        return declaresCte(selectNode, asText(fromRef, FIELD_TABLE_NAME));
+    }
+
+    /** True if {@code selectNode}'s WITH clause declares a CTE named {@code name}. */
+    private static boolean declaresCte(JsonNode selectNode, String name) {
         if (name == null || name.isEmpty()) return false;
         JsonNode cteMap = selectNode.get(FIELD_CTE_MAP);
         if (cteMap == null) return false;
@@ -952,6 +963,199 @@ public class Transformations {
             if (key != null && name.equals(key.asText())) return true;
         }
         return false;
+    }
+
+    /**
+     * Scope-aware variant of {@link #pruneUnusedLeftJoins(JsonNode, JsonNode)}: prune the view's
+     * unused LEFT JOINs even when the view is referenced <em>inside a CTE body</em> rather than at
+     * the outer top-level FROM. {@code viewName} names the catalog view whose body is {@code
+     * viewBodyAst}, so a reference to it can be located by name.
+     *
+     * <p>Every eligible reference is pruned <b>independently within its own scope</b> — inlining
+     * is local and semantics-preserving, so any subset of references may be optimized:
+     * <ul>
+     *   <li><b>Top-level</b> — the outer FROM is the view. Usage is collected from the outer
+     *       SELECT scope <em>excluding</em> CTE bodies (a CTE cannot reference the outer FROM's
+     *       columns), so sibling CTE usage does not pollute top-level pruning.</li>
+     *   <li><b>CTE-nested</b> — the view is referenced in the FROM of one or more CTE bodies
+     *       (e.g. {@code WITH a AS (SELECT a_name FROM fv) SELECT * FROM a}). Each CTE body is its
+     *       own scope: column usage and the STAR check are evaluated there, so an outer
+     *       {@code SELECT *} over the CTE — which expands to CTE columns, not view columns — does
+     *       not block the optimization. The view body is inlined as a subquery in place of the
+     *       reference inside the CTE body; the CTE's own SELECT list is untouched.</li>
+     * </ul>
+     * A scope whose view columns cannot be enumerated (a bare or qualified STAR in that scope) is
+     * skipped individually; other references are still pruned.
+     *
+     * <p>{@code viewName} may be qualified ({@code s2.fv}, {@code cat.s2.fv}); qualification must
+     * match the reference at the same level. An unqualified name matches only unqualified
+     * references (a qualified reference may be a different, same-named view); a qualified name
+     * matches only identically-qualified references (an unqualified reference resolves via the
+     * search path, invisible at the AST level).
+     *
+     * <p>Bails entirely when an unqualified view name is bound by a CTE anywhere in the outer WITH
+     * clause (a local CTE shadows the catalog view — a qualified reference can never resolve to a
+     * CTE, so qualified names skip this bail), or on any structural surprise.
+     *
+     * @param outerSqlAst parsed outer query (statement wrapper from {@code parseToTree})
+     * @param viewName    name of the catalog view to locate in {@code outerSqlAst}; may be
+     *                    schema/catalog-qualified
+     * @param viewBodyAst parsed view body (the F/A/B join SELECT)
+     * @return rewritten outer AST with each eligible view reference inlined as a pruned subquery,
+     *         or {@code outerSqlAst} unchanged
+     */
+    public static JsonNode pruneUnusedLeftJoins(JsonNode outerSqlAst, String viewName, JsonNode viewBodyAst) {
+        try {
+            if (viewName == null || viewName.isEmpty()) return pruneUnusedLeftJoins(outerSqlAst, viewBodyAst);
+            QualifiedName view = QualifiedName.parse(viewName);
+            JsonNode outerNode = getFirstStatementNode(outerSqlAst);
+            if (!NODE_TYPE_SELECT_NODE.equals(asText(outerNode, FIELD_TYPE))) return outerSqlAst;
+
+            // An unqualified view name rebound by a CTE in this query's WITH clause → any
+            // unqualified reference to it resolves to that CTE, not the view. Too risky to inline
+            // anywhere here. (A qualified reference like s2.fv can never resolve to a CTE, so
+            // qualified view names skip this bail.)
+            if (!view.isQualified() && declaresCte(outerNode, view.table)) return outerSqlAst;
+
+            // Locate every eligible reference: the top-level FROM and/or any CTE bodies.
+            boolean topLevel = isViewRef(outerNode.get(FIELD_FROM_TABLE), view);
+            List<Integer> cteRefs = findCtesReferencingView(outerNode, view);
+            if (!topLevel && cteRefs.isEmpty()) return outerSqlAst;
+
+            ObjectNode rootCopy = (ObjectNode) outerSqlAst.deepCopy();
+            ObjectNode outerCopy = (ObjectNode) getFirstStatementNode(rootCopy);
+            boolean changed = false;
+            for (int idx : cteRefs) {
+                ObjectNode cteBody = (ObjectNode) outerCopy.get(FIELD_CTE_MAP).get(FIELD_MAP)
+                        .get(idx).get("value").get("query").get("node");
+                changed |= pruneScope(cteBody, viewBodyAst, collectScopedUsage(cteBody, false));
+            }
+            if (topLevel) {
+                // The top-level scope excludes CTE bodies: a CTE cannot see the outer FROM's
+                // columns, so its usage is irrelevant to this reference.
+                changed |= pruneScope(outerCopy, viewBodyAst, collectScopedUsage(outerCopy, true));
+            }
+            return changed ? rootCopy : outerSqlAst;
+        } catch (RuntimeException e) {
+            return outerSqlAst;
+        }
+    }
+
+    /** Collect column usage for one SELECT scope, optionally skipping its {@code cte_map} subtree. */
+    private static UsedColumns collectScopedUsage(ObjectNode scopeNode, boolean excludeCteMap) {
+        UsedColumns use = new UsedColumns();
+        if (!excludeCteMap) {
+            collectUsage(scopeNode, use);
+            return use;
+        }
+        var fields = scopeNode.fields();
+        while (fields.hasNext()) {
+            var entry = fields.next();
+            if (!FIELD_CTE_MAP.equals(entry.getKey())) collectUsage(entry.getValue(), use);
+        }
+        return use;
+    }
+
+    /**
+     * Prune the view body against one scope's usage and inline it in place of that scope's FROM.
+     * A scope containing a STAR cannot enumerate its view columns and is skipped (returns false);
+     * other references remain eligible.
+     */
+    private static boolean pruneScope(ObjectNode scopeNode, JsonNode viewBodyAst, UsedColumns use) {
+        if (use.hasStar || use.hasQualifiedStar) return false;
+        return pruneViewBodyInto(scopeNode, scopeNode.get(FIELD_FROM_TABLE), viewBodyAst, use.columnNames);
+    }
+
+    /**
+     * A view name split into its optional catalog / optional schema / table parts.
+     * {@code fv} → table only; {@code s2.fv} → schema+table; {@code cat.s2.fv} → all three.
+     * Dotted parts inside quoted identifiers are not supported — a name with more than three
+     * parts is treated as never matching (the transform then degrades to its no-op).
+     */
+    private record QualifiedName(String catalog, String schema, String table) {
+        static QualifiedName parse(String name) {
+            String[] parts = name.split("\\.");
+            return switch (parts.length) {
+                case 1 -> new QualifiedName(null, null, parts[0]);
+                case 2 -> new QualifiedName(null, parts[0], parts[1]);
+                case 3 -> new QualifiedName(parts[0], parts[1], parts[2]);
+                default -> new QualifiedName(null, null, null); // unmatchable
+            };
+        }
+
+        boolean isQualified() { return schema != null || catalog != null; }
+    }
+
+    /**
+     * True if {@code fromRef} is a single BASE_TABLE reference to {@code view}, with qualification
+     * matched at the same level:
+     * <ul>
+     *   <li>an <b>unqualified</b> view name matches only an unqualified reference — a qualified
+     *       reference ({@code s2.fv}) may be a different, same-named view;</li>
+     *   <li>a <b>qualified</b> view name matches only a reference qualified identically — an
+     *       unqualified reference resolves via the search path, which is invisible at the AST
+     *       level, so it never matches.</li>
+     * </ul>
+     */
+    private static boolean isViewRef(JsonNode fromRef, QualifiedName view) {
+        if (fromRef == null
+                || view.table == null
+                || !NODE_TYPE_BASE_TABLE.equals(asText(fromRef, FIELD_TYPE))
+                || !view.table.equals(asText(fromRef, FIELD_TABLE_NAME))) return false;
+        return qualifierMatches(view.schema, asText(fromRef, FIELD_SCHEMA_NAME))
+                && qualifierMatches(view.catalog, asText(fromRef, FIELD_CATALOG_NAME));
+    }
+
+    /** Both absent, or both present and equal. */
+    private static boolean qualifierMatches(String expected, String actual) {
+        boolean expectedEmpty = expected == null || expected.isEmpty();
+        boolean actualEmpty = actual == null || actual.isEmpty();
+        if (expectedEmpty != actualEmpty) return false;
+        return expectedEmpty || expected.equals(actual);
+    }
+
+    /**
+     * Indexes in the outer WITH map of every CTE whose body's FROM is a reference to {@code view}
+     * (not shadowed by that CTE body's own nested WITH — applicable to unqualified names only,
+     * since a qualified reference can never resolve to a CTE). Sibling/outer shadowing of an
+     * unqualified name is handled by the caller's {@link #declaresCte} bail.
+     */
+    private static List<Integer> findCtesReferencingView(JsonNode outerNode, QualifiedName view) {
+        JsonNode cteMap = outerNode.get(FIELD_CTE_MAP);
+        if (cteMap == null) return List.of();
+        JsonNode map = cteMap.get(FIELD_MAP);
+        if (map == null || !map.isArray()) return List.of();
+        List<Integer> found = new ArrayList<>();
+        for (int i = 0; i < map.size(); i++) {
+            JsonNode body = map.get(i).path("value").path("query").path("node");
+            if (!NODE_TYPE_SELECT_NODE.equals(asText(body, FIELD_TYPE))) continue;
+            JsonNode from = body.get(FIELD_FROM_TABLE);
+            if (isViewRef(from, view)
+                    && (view.isQualified() || !referencesOuterCte(body, from))) {
+                found.add(i);
+            }
+        }
+        return found;
+    }
+
+    /**
+     * Shared core: prune {@code viewBodyAst} to {@code usedViewCols}, eliminate the now-unused LEFT
+     * JOINs, and inline the result as a subquery in place of {@code scopeNode}'s FROM. Mutates the
+     * (already-copied) {@code scopeNode}. Returns whether anything changed.
+     */
+    private static boolean pruneViewBodyInto(ObjectNode scopeNode, JsonNode viewRef,
+                                             JsonNode viewBodyAst, Set<String> usedViewCols) {
+        JsonNode bodyNode = getFirstStatementNode(viewBodyAst);
+        if (!NODE_TYPE_SELECT_NODE.equals(asText(bodyNode, FIELD_TYPE))) return false;
+        if (hasUnsupportedJoin(bodyNode.get(FIELD_FROM_TABLE))) return false;
+
+        ObjectNode body = (ObjectNode) bodyNode.deepCopy();
+        boolean changed = projectionPruningIsSafe(body) && pruneSelectList(body, usedViewCols);
+        changed |= eliminateUnusedLeftJoins(body);
+        if (!changed) return false;
+
+        scopeNode.set(FIELD_FROM_TABLE, wrapAsSubquery(body, effectiveId(viewRef), viewRef));
+        return true;
     }
 
     /** Column usage collected from the outer query: referenced name parts and STAR presence. */

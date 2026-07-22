@@ -15,6 +15,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -108,6 +109,21 @@ public class PruneUnusedLeftJoinsTest {
         return Transformations.pruneUnusedLeftJoins(outer, body);
     }
 
+    /** Scope-aware (three-arg) prune, locating the view by name. */
+    private JsonNode prune(String outerSql, String viewName, String viewBody) throws Exception {
+        JsonNode outer = Transformations.parseToTree(conn, outerSql);
+        JsonNode body = Transformations.parseToTree(conn, viewBody);
+        return Transformations.pruneUnusedLeftJoins(outer, viewName, body);
+    }
+
+    /** Assert the three-arg (scope-aware) method bailed out: the exact input instance comes back. */
+    private void assertBailsOut(String outerSql, String viewName, String viewBody) throws Exception {
+        JsonNode outer = Transformations.parseToTree(conn, outerSql);
+        JsonNode body = Transformations.parseToTree(conn, viewBody);
+        JsonNode pruned = Transformations.pruneUnusedLeftJoins(outer, viewName, body);
+        assertSame(outer, pruned, "expected a no-op (same instance returned) for: " + outerSql);
+    }
+
     /** Assert the method bailed out: the exact input instance comes back. */
     private void assertBailsOut(String outerSql, String viewBody) throws Exception {
         JsonNode outer = Transformations.parseToTree(conn, outerSql);
@@ -129,6 +145,13 @@ public class PruneUnusedLeftJoinsTest {
             for (JsonNode child : node) c += countJoins(child);
         }
         return c;
+    }
+
+    /** Count non-overlapping occurrences of {@code needle} in {@code haystack}. */
+    private int countOccurrences(String haystack, String needle) {
+        int count = 0;
+        for (int i = haystack.indexOf(needle); i >= 0; i = haystack.indexOf(needle, i + needle.length())) count++;
+        return count;
     }
 
     private List<List<Object>> exec(String sql) throws SQLException {
@@ -378,5 +401,267 @@ public class PruneUnusedLeftJoinsTest {
                 "WITH fv AS (SELECT 42 AS f_col, 'zz' AS a_name, 'yy' AS b_name) " +
                 "SELECT f_col FROM fv";
         assertBailsOut(outer, VIEW_BODY);
+    }
+
+    // ---- scope-aware (three-arg) prune: view referenced inside a CTE body ----
+
+    @Test
+    void cteWrappingView_prunedWithinCteBody() throws Exception {
+        // The view is referenced inside the CTE `a`, which projects only a_name; the outer
+        // SELECT * is over the CTE (expands to a_name), NOT the view. b is used nowhere in the
+        // view's scope, so its join must be eliminated inside the CTE body.
+        String outer = "WITH a AS (SELECT a_name FROM fv) SELECT * FROM a";
+        JsonNode pruned = prune(outer, "fv", VIEW_BODY);
+
+        assertEquals(1, countJoins(pruned), "b join must be eliminated inside the CTE body; a kept");
+        String sql = Transformations.parseToSql(conn, pruned).toLowerCase();
+        assertFalse(sql.contains("b_name"), "b_name projection should be gone");
+        assertEquivalentToView(pruned, outer);
+        assertEquals(3, exec(Transformations.parseToSql(conn, pruned)).size(),
+                "all fact rows (incl. the b-unmatched one) must survive");
+    }
+
+    @Test
+    void cteWrappingView_dimColumnUsedInCteBody_joinKept() throws Exception {
+        // b_name IS referenced in the CTE body (WHERE), so the b join must be kept; a_name unused
+        // in the view's scope, so the a join is eliminated.
+        String outer = "WITH a AS (SELECT f_col FROM fv WHERE b_name = 'b100') SELECT * FROM a";
+        JsonNode pruned = prune(outer, "fv", VIEW_BODY);
+
+        String sql = Transformations.parseToSql(conn, pruned).toLowerCase();
+        assertTrue(sql.contains("b_name"), "b_name is used in the CTE body, so the b join must be kept");
+        assertFalse(sql.contains("a_name"), "a_name is unused, so the a join must be dropped");
+        assertEquals(1, countJoins(pruned));
+        assertEquivalentToView(pruned, outer);
+    }
+
+    @Test
+    void threeArg_topLevelViewFrom_delegatesToV1() throws Exception {
+        // When the outer FROM is the view itself, the scope-aware entry point matches the v1 path.
+        String outer = "SELECT f_col, a_name FROM fv WHERE f_col > 10";
+        JsonNode pruned = prune(outer, "fv", VIEW_BODY);
+
+        assertEquals(1, countJoins(pruned), "b eliminated, a kept");
+        assertEquivalentToView(pruned, outer);
+    }
+
+    @Test
+    void cteWrappingView_bothDimsUsedInCteBody_returnedUnchanged() throws Exception {
+        // Both dimension columns flow through the CTE body → nothing to prune or eliminate → no-op.
+        assertBailsOut("WITH a AS (SELECT a_name, b_name FROM fv) SELECT * FROM a", "fv", VIEW_BODY);
+    }
+
+    @Test
+    void starOverViewInsideCteBody_returnedUnchanged() throws Exception {
+        // The CTE body does SELECT * over the view — its columns cannot be enumerated, so the STAR
+        // bail applies within the view's scope even though the reference is nested.
+        assertBailsOut("WITH a AS (SELECT * FROM fv) SELECT a_name FROM a", "fv", VIEW_BODY);
+    }
+
+    @Test
+    void viewNameReboundBySiblingCte_returnedUnchanged() throws Exception {
+        // `fv` is declared as a CTE in the same WITH, so the reference inside CTE `a` resolves to
+        // that CTE, not the catalog view. Must bail.
+        String outer =
+                "WITH fv AS (SELECT 1 AS a_name), a AS (SELECT a_name FROM fv) SELECT * FROM a";
+        assertBailsOut(outer, "fv", VIEW_BODY);
+    }
+
+    @Test
+    void viewReferencedByTwoCteBodies_eachPrunedInItsOwnScope() throws Exception {
+        // Both CTEs reference the view; each is pruned against its own usage:
+        // CTE a uses a_name → keeps join a, drops join b. CTE b uses f_col only → drops both.
+        String outer =
+                "WITH a AS (SELECT a_name FROM fv), b AS (SELECT f_col FROM fv) " +
+                "SELECT * FROM a, b";
+        JsonNode pruned = prune(outer, "fv", VIEW_BODY);
+
+        String sql = Transformations.parseToSql(conn, pruned).toLowerCase();
+        assertEquals(1, countOccurrences(sql, "left join"),
+                "one LEFT JOIN total: a's inline keeps join a; b's inline drops both");
+        assertFalse(sql.contains("b_name"), "b_name is unused in every scope");
+        assertEquivalentToView(pruned, outer);
+    }
+
+    @Test
+    void viewReferencedTopLevelAndInCte_bothPrunedIndependently() throws Exception {
+        // Top-level scope uses f_col + b_name (drops join a); CTE scope uses a_name (drops join b).
+        // Each reference is pruned against its own scope's usage.
+        String outer =
+                "WITH c AS (SELECT a_name FROM fv) " +
+                "SELECT f_col, b_name FROM fv WHERE f_col > (SELECT count(*) FROM c)";
+        JsonNode pruned = prune(outer, "fv", VIEW_BODY);
+
+        assertEquals(2, countJoins(pruned),
+                "top-level inline keeps join b, CTE inline keeps join a — one join each");
+        String sql = Transformations.parseToSql(conn, pruned).toLowerCase();
+        assertTrue(sql.contains("a_name"), "CTE scope needs a_name");
+        assertTrue(sql.contains("b_name"), "top-level scope needs b_name");
+        assertEquivalentToView(pruned, outer);
+    }
+
+    @Test
+    void starScopeSkipped_otherReferenceStillPruned() throws Exception {
+        // CTE a does SELECT * over the view (columns not enumerable → skipped, stays a raw view
+        // reference); CTE b is still pruned to zero joins.
+        String outer =
+                "WITH a AS (SELECT * FROM fv), b AS (SELECT f_col FROM fv) " +
+                "SELECT a.a_name, b.f_col FROM a, b";
+        JsonNode pruned = prune(outer, "fv", VIEW_BODY);
+
+        String sql = Transformations.parseToSql(conn, pruned).toLowerCase();
+        assertEquals(0, countOccurrences(sql, "left join"),
+                "b's inline drops both joins; a's star scope is skipped, not inlined");
+        assertTrue(sql.contains("fv"), "the star CTE must still reference the view by name");
+        assertEquivalentToView(pruned, outer);
+    }
+
+    // ---- review probes: edge cases ----
+
+    @Test
+    void nestedWithInsideCteBodyShadowsView_returnedUnchanged() throws Exception {
+        // The CTE body carries its own WITH that rebinds `fv`; the inner FROM fv resolves to that
+        // nested CTE, not the catalog view. Inlining the view body there would replace 'inner'
+        // with real fact data. Must bail.
+        String outer =
+                "WITH a AS (WITH fv AS (SELECT 'inner' AS a_name) SELECT a_name FROM fv) " +
+                "SELECT * FROM a";
+        assertBailsOut(outer, "fv", VIEW_BODY);
+    }
+
+    @Test
+    void viewInCteAndOuterFromJoin_cteBodyPruned_outerRefUntouched() throws Exception {
+        // The view appears both inside CTE `a` and in the outer FROM join. Only the CTE body is
+        // eligible (outer FROM is not a single base table); the outer fv reference must keep
+        // pointing at the real view and results must be equivalent.
+        String outer =
+                "WITH a AS (SELECT a_name FROM fv) " +
+                "SELECT a.a_name, fv.b_name FROM a, fv";
+        JsonNode outerAst = Transformations.parseToTree(conn, outer);
+        JsonNode pruned = Transformations.pruneUnusedLeftJoins(
+                outerAst, "fv", Transformations.parseToTree(conn, VIEW_BODY));
+
+        assertNotSame(outerAst, pruned, "the CTE body is eligible, so a rewrite must occur");
+        String sql = Transformations.parseToSql(conn, pruned).toLowerCase();
+        assertTrue(sql.contains("fv"), "the outer FROM must still reference the view by name");
+        assertEquivalentToView(pruned, outer);
+    }
+
+    @Test
+    void schemaQualifiedSameNamedView_returnedUnchanged() throws Exception {
+        // s2.fv is a DIFFERENT view that happens to share the name. viewName "fv" is unqualified,
+        // so a schema-qualified reference must not match — inlining the default-schema body in its
+        // place would silently swap the view. Must bail.
+        conn.createStatement().execute("CREATE SCHEMA IF NOT EXISTS s2");
+        conn.createStatement().execute(
+                "CREATE OR REPLACE VIEW s2.fv AS SELECT 'other' AS a_name, 'x' AS b_name, 0 AS f_col");
+        try {
+            assertBailsOut("WITH a AS (SELECT a_name FROM s2.fv) SELECT * FROM a", "fv", VIEW_BODY);
+        } finally {
+            conn.createStatement().execute("DROP VIEW IF EXISTS s2.fv");
+            conn.createStatement().execute("DROP SCHEMA IF EXISTS s2");
+        }
+    }
+
+    @Test
+    void aliasedViewRefInCteBody_pruned() throws Exception {
+        // The view is referenced with an alias inside the CTE body; qualification uses the alias.
+        String outer = "WITH a AS (SELECT x.a_name FROM fv x) SELECT * FROM a";
+        JsonNode pruned = prune(outer, "fv", VIEW_BODY);
+
+        assertEquals(1, countJoins(pruned), "b join eliminated; a kept");
+        assertEquivalentToView(pruned, outer);
+    }
+
+    // ---- qualified viewName matching ----
+
+    @Test
+    void qualifiedViewName_matchesQualifiedRefInCteBody() throws Exception {
+        // viewName "s3.fv" must match FROM s3.fv inside the CTE body and prune there.
+        conn.createStatement().execute("CREATE SCHEMA IF NOT EXISTS s3");
+        conn.createStatement().execute("CREATE OR REPLACE VIEW s3.fv AS " + VIEW_BODY);
+        try {
+            String outer = "WITH a AS (SELECT a_name FROM s3.fv) SELECT * FROM a";
+            JsonNode pruned = prune(outer, "s3.fv", VIEW_BODY);
+
+            assertEquals(1, countJoins(pruned), "b join eliminated inside the CTE body; a kept");
+            String sql = Transformations.parseToSql(conn, pruned).toLowerCase();
+            assertFalse(sql.contains("b_name"), "b_name projection should be gone");
+            assertEquivalentToView(pruned, outer);
+        } finally {
+            conn.createStatement().execute("DROP VIEW IF EXISTS s3.fv");
+            conn.createStatement().execute("DROP SCHEMA IF EXISTS s3");
+        }
+    }
+
+    @Test
+    void qualifiedViewName_matchesQualifiedRefAtTopLevel() throws Exception {
+        // Top-level FROM s3.fv with viewName "s3.fv" delegates to the v1 path.
+        conn.createStatement().execute("CREATE SCHEMA IF NOT EXISTS s3");
+        conn.createStatement().execute("CREATE OR REPLACE VIEW s3.fv AS " + VIEW_BODY);
+        try {
+            String outer = "SELECT f_col, a_name FROM s3.fv WHERE f_col > 10";
+            JsonNode pruned = prune(outer, "s3.fv", VIEW_BODY);
+
+            assertEquals(1, countJoins(pruned), "b eliminated, a kept");
+            assertEquivalentToView(pruned, outer);
+        } finally {
+            conn.createStatement().execute("DROP VIEW IF EXISTS s3.fv");
+            conn.createStatement().execute("DROP SCHEMA IF EXISTS s3");
+        }
+    }
+
+    @Test
+    void qualifiedViewName_doesNotMatchUnqualifiedRef() throws Exception {
+        // An unqualified FROM fv resolves via the search path — invisible at the AST level — so a
+        // qualified viewName must not match it. No-op.
+        assertBailsOut("WITH a AS (SELECT a_name FROM fv) SELECT * FROM a", "s3.fv", VIEW_BODY);
+        assertBailsOut("SELECT f_col, a_name FROM fv", "s3.fv", VIEW_BODY);
+    }
+
+    @Test
+    void qualifiedRefAtTopLevel_notShadowedByCteOfSameBareName_stillPruned() throws Exception {
+        // Top-level variant of the shadow case: a CTE named `fv` exists, but the top-level FROM is
+        // the qualified s3.fv, which always resolves to the catalog. The v1 delegation path must
+        // not let the bare-name CTE block pruning.
+        conn.createStatement().execute("CREATE SCHEMA IF NOT EXISTS s3");
+        conn.createStatement().execute("CREATE OR REPLACE VIEW s3.fv AS " + VIEW_BODY);
+        try {
+            String outer =
+                    "WITH fv AS (SELECT 1 AS t) " +
+                    "SELECT f_col, a_name FROM s3.fv WHERE f_col > (SELECT t FROM fv)";
+            JsonNode outerAst = Transformations.parseToTree(conn, outer);
+            JsonNode pruned = Transformations.pruneUnusedLeftJoins(
+                    outerAst, "s3.fv", Transformations.parseToTree(conn, VIEW_BODY));
+
+            assertNotSame(outerAst, pruned,
+                    "the bare-name CTE must not block pruning of the qualified s3.fv reference");
+            assertEquals(1, countJoins(pruned), "b eliminated, a kept — view inlined at top level");
+            assertEquivalentToView(pruned, outer);
+        } finally {
+            conn.createStatement().execute("DROP VIEW IF EXISTS s3.fv");
+            conn.createStatement().execute("DROP SCHEMA IF EXISTS s3");
+        }
+    }
+
+    @Test
+    void qualifiedRef_notShadowedByCteOfSameBareName_stillPruned() throws Exception {
+        // A CTE named `fv` shadows only unqualified references; s3.fv always resolves to the
+        // catalog. With a qualified viewName the shadow bail must not block pruning.
+        conn.createStatement().execute("CREATE SCHEMA IF NOT EXISTS s3");
+        conn.createStatement().execute("CREATE OR REPLACE VIEW s3.fv AS " + VIEW_BODY);
+        try {
+            String outer =
+                    "WITH fv AS (SELECT 'cte' AS tag), a AS (SELECT a_name FROM s3.fv) " +
+                    "SELECT a.a_name, fv.tag FROM a, fv";
+            JsonNode pruned = prune(outer, "s3.fv", VIEW_BODY);
+
+            String sql = Transformations.parseToSql(conn, pruned).toLowerCase();
+            assertFalse(sql.contains("b_name"), "b join must be pruned despite the fv-named CTE");
+            assertEquivalentToView(pruned, outer);
+        } finally {
+            conn.createStatement().execute("DROP VIEW IF EXISTS s3.fv");
+            conn.createStatement().execute("DROP SCHEMA IF EXISTS s3");
+        }
     }
 }
