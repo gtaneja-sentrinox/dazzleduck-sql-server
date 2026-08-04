@@ -62,6 +62,49 @@ public class SqlAuthorizerLimitTest {
         assertEquals(5L, extractLimit(authorized));
     }
 
+    private static long extractOffset(JsonNode authorized) {
+        JsonNode statement = authorized.get(ExpressionConstants.FIELD_STATEMENTS)
+                .get(0).get(ExpressionConstants.FIELD_NODE);
+        ArrayNode modifiers = (ArrayNode) statement.get(ExpressionConstants.FIELD_MODIFIERS);
+        for (JsonNode modifier : modifiers) {
+            if (modifier.get(ExpressionConstants.FIELD_TYPE).asText()
+                    .equals(ExpressionConstants.LIMIT_MODIFIER_TYPE)) {
+                return modifier.get(ExpressionConstants.FIELD_OFFSET)
+                        .get(ExpressionConstants.FIELD_VALUE)
+                        .get(ExpressionConstants.FIELD_VALUE).asLong();
+            }
+        }
+        throw new AssertionError("No LIMIT_MODIFIER with offset found in: " + authorized);
+    }
+
+    private static boolean hasModifierOfType(JsonNode authorized, String modifierType) {
+        JsonNode statement = authorized.get(ExpressionConstants.FIELD_STATEMENTS)
+                .get(0).get(ExpressionConstants.FIELD_NODE);
+        ArrayNode modifiers = (ArrayNode) statement.get(ExpressionConstants.FIELD_MODIFIERS);
+        if (modifiers == null) return false;
+        for (JsonNode modifier : modifiers) {
+            if (modifier.get(ExpressionConstants.FIELD_TYPE).asText().equals(modifierType)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Pagination correctness: a query that already carries {@code ORDER BY} must keep it after the
+     * authorizer injects LIMIT/OFFSET, and the LIMIT modifier must carry the offset — both on the
+     * same outer SELECT. This is what makes classic-search v2 paging deterministic: ORDER BY governs
+     * the total order and LIMIT/OFFSET slice the page after it.
+     */
+    @Test
+    public void testAddLimit_preservesOrderBy_andAppliesOffset() throws Exception {
+        JsonNode query = Transformations.parseToTree("SELECT a, b FROM t ORDER BY a DESC, rowid ASC");
+        JsonNode authorized = PASSTHROUGH.authorize("user", "db", "schema", query, Map.of(), 10L, 20L);
+
+        assertEquals(true, hasModifierOfType(authorized, ExpressionConstants.TYPE_ORDER_MODIFIER),
+                "ORDER BY modifier must survive LIMIT/OFFSET injection: " + authorized);
+        assertEquals(10L, extractLimit(authorized), "limit");
+        assertEquals(20L, extractOffset(authorized), "offset");
+    }
+
     @Test
     public void testAddLimit_noLimit_noOffset_unchanged() throws Exception {
         JsonNode query = Transformations.parseToTree("SELECT * FROM t");
