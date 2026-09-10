@@ -243,14 +243,29 @@ public class SqlAuthorizerLimitTest {
     // ── offset past the query's own LIMIT is rejected, not served as an empty page ────────────
 
     @Test
-    public void testOffset_atTemplateLimitIsRejected() throws Exception {
-        // LIMIT 10 with a request offset of 10: that page is empty. Merging modifiers would hand
-        // back rows 11-20 - rows the template's own LIMIT excluded.
+    public void testOffset_exactlyAtTemplateLimitIsAnEmptyPage() throws Exception {
+        // offset == own LIMIT is the end of the result, not an error: a client paging until it
+        // sees a short page must be able to request that page and get zero rows back. Rejecting
+        // it ended every such scan in a server error.
         JsonNode query = Transformations.parseToTree("SELECT * FROM range(100) LIMIT 10");
-        IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () ->
-                PASSTHROUGH.authorize("user", "db", "schema", query, Map.of(), 1000L, 10L));
-        assertEquals(true, e.getMessage().contains("at or past the query's own LIMIT 10"),
-                "message must name the offending bound: " + e.getMessage());
+        JsonNode authorized = PASSTHROUGH.authorize("user", "db", "schema", query, Map.of(), 1000L, 10L);
+        assertEquals(0L, rowsOf(authorized), "the page at the end of the result must be empty");
+    }
+
+    @Test
+    public void testOffset_pageUntilShortPageTerminates() throws Exception {
+        // The loop the previous contract broke: cap 10 over a template LIMIT 100 yields ten full
+        // pages, then an empty one. No page may raise.
+        long total = 0;
+        for (int offset = 0; offset <= 100; offset += 10) {
+            JsonNode q = Transformations.parseToTree("SELECT * FROM range(1000) LIMIT 100");
+            final int off = offset;
+            JsonNode authorized = assertDoesNotThrow(() -> PASSTHROUGH.authorize(
+                    "user", "db", "schema", q, Map.of(), 10L, (long) off),
+                    "offset " + offset + " must not raise");
+            total += rowsOf(authorized);
+        }
+        assertEquals(100L, total, "ten pages of 10 then an empty page");
     }
 
     @Test
@@ -363,9 +378,10 @@ public class SqlAuthorizerLimitTest {
 
     @Test
     public void testApplyOffset_rejectionIsRaisedByTheOffsetMethod() throws Exception {
-        // The guard belongs to offset semantics, so applyOffset alone must raise it.
+        // The guard belongs to offset semantics, so applyOffset alone must raise it. 11 is
+        // strictly past the query's own LIMIT 10; 10 itself is the allowed empty page.
         JsonNode query = Transformations.parseToTree("SELECT * FROM range(100) LIMIT 10");
-        assertThrows(IllegalArgumentException.class, () -> Transformations.applyOffset(query, 10L));
+        assertThrows(IllegalArgumentException.class, () -> Transformations.applyOffset(query, 11L));
     }
 
     // ── LIMIT n% is rejected when a cap or offset applies ────────────────────────────────────
@@ -512,5 +528,75 @@ public class SqlAuthorizerLimitTest {
         JsonNode query = Transformations.parseToTree("SELECT * FROM range(100) OFFSET 2+3");
         JsonNode authorized = PASSTHROUGH.authorize("user", "db", "schema", query, Map.of(), 1000L, 10L);
         assertEquals(15L, firstValueOf(authorized), "add(coalesce(2+3,0), 10) must be 15");
+    }
+
+    // ── code-review findings on PR #409 ──────────────────────────────────────────────────────
+
+    @Test
+    public void testDecimalLimit_isNotReadAsItsUnscaledValue() throws Exception {
+        // DuckDB serializes DECIMAL as an unscaled integer plus a scale, so LIMIT 10.9 arrives as
+        // 109. Reading that as a literal emitted LIMIT 109 - widening the query's own bound by
+        // 10^scale, the exact bug this class exists to prevent. It must be rejected instead.
+        for (String limit : new String[]{"10.9", "10.0", "0.5"}) {
+            JsonNode query = Transformations.parseToTree("SELECT * FROM range(100) LIMIT " + limit);
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () ->
+                    PASSTHROUGH.authorize("user", "db", "schema", query, Map.of(), 1000L, -1L),
+                    "LIMIT " + limit + " must not be treated as an integer literal");
+            assertEquals(true, e.getMessage().contains("integer literal"), e.getMessage());
+        }
+    }
+
+    @Test
+    public void testDecimalOffset_isNotReadAsItsUnscaledValue() throws Exception {
+        // Same trap on the offset side: OFFSET 5.0 arrives as 50, so composing gave OFFSET 60
+        // instead of 15. Non-literal offsets compose at execution time, so the result is correct
+        // rather than rejected.
+        JsonNode query = Transformations.parseToTree("SELECT * FROM range(100) OFFSET 5.0");
+        JsonNode authorized = PASSTHROUGH.authorize("user", "db", "schema", query, Map.of(), 1000L, 10L);
+        assertEquals(15L, firstValueOf(authorized), "5.0 + 10 must be 15, not 60");
+    }
+
+    @Test
+    public void testDoubleLimit_isRejected() throws Exception {
+        // LIMIT 1e2 serializes as a DOUBLE whose value is 100.0.
+        JsonNode query = Transformations.parseToTree("SELECT * FROM range(100) LIMIT 1e2");
+        assertThrows(IllegalArgumentException.class, () ->
+                PASSTHROUGH.authorize("user", "db", "schema", query, Map.of(), 10L, -1L));
+    }
+
+    @Test
+    public void testLargeIntegerLimit_isStillAccepted() throws Exception {
+        // BIGINT-typed literals must keep working - the type check must not be over-tight.
+        JsonNode query = Transformations.parseToTree("SELECT * FROM range(100) LIMIT 3000000000");
+        JsonNode authorized = PASSTHROUGH.authorize("user", "db", "schema", query, Map.of(), 7L, -1L);
+        assertEquals(7L, rowsOf(authorized), "a BIGINT literal must be capped, not rejected");
+    }
+
+    @Test
+    public void testZeroOffset_isATrueNoOp() throws Exception {
+        // The cap path passes offset = 0. That must not fabricate an OFFSET 0, and must not make
+        // applyOffset reject constructs an uncapped read is documented to leave alone.
+        JsonNode plain = Transformations.parseToTree("SELECT * FROM range(100)");
+        assertEquals("SELECT * FROM \"range\"(100)",
+                Transformations.parseToSql(Transformations.applyOffset(plain, 0L)),
+                "offset 0 must not add an OFFSET clause");
+
+        for (String sql : new String[]{"SELECT * FROM range(100) LIMIT 3%",
+                                       "SELECT * FROM range(100) LIMIT 5+5"}) {
+            JsonNode q = Transformations.parseToTree(sql);
+            assertDoesNotThrow(() -> Transformations.applyOffset(q, 0L),
+                    "offset 0 bounds nothing, so it must not reject: " + sql);
+        }
+    }
+
+    @Test
+    public void testNegativeLimit_reportsTheLimitNotTheOffset() throws Exception {
+        // DuckDB folds LIMIT -1 into a constant, so it used to be reported as
+        // "'offset' 3 is at or past the query's own LIMIT -1" - misdirecting to the offset.
+        JsonNode query = Transformations.parseToTree("SELECT * FROM range(100) LIMIT -1");
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () ->
+                PASSTHROUGH.authorize("user", "db", "schema", query, Map.of(), 10L, 3L));
+        assertEquals(true, e.getMessage().contains("must not be negative"),
+                "message must point at the LIMIT: " + e.getMessage());
     }
 }

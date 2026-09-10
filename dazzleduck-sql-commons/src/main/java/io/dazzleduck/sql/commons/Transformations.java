@@ -1959,15 +1959,19 @@ public class Transformations {
      *
      * <p>A negative {@code offset} means "no offset" and leaves the query untouched.
      *
-     * @throws IllegalArgumentException if the offset lands at or past the query's own literal
-     *         LIMIT - that page is empty, and serving it silently would let a paginating client
-     *         mistake "past the end" for "no more data" (the same reasoning as {@code
-     *         resolveLimit} rejecting rather than clamping), or if the query's LIMIT is not an
-     *         integer literal - see {@link #rejectNonLiteralLimit}.
+     * <p>A zero or negative {@code offset} means "no offset" and leaves the query untouched -
+     * including its modifiers and any construct {@link #rejectNonLiteralLimit} would refuse, since
+     * nothing is being bounded.
+     *
+     * @throws IllegalArgumentException if the offset lands strictly <i>past</i> the query's own
+     *         literal LIMIT. An offset exactly <i>at</i> that LIMIT is allowed and yields an empty
+     *         page, so the usual "request pages until a short page" loop still terminates; going
+     *         beyond it can only be a client error. Also thrown if the query's LIMIT is not a
+     *         non-negative integer literal - see {@link #rejectNonLiteralLimit}.
      */
     public static JsonNode applyOffset(JsonNode query, long offset) {
-        if (offset < 0) {
-            return query;
+        if (offset <= 0) {
+            return query;   // skipping zero rows changes nothing - do not touch the AST
         }
         ObjectNode modifier = limitModifierOf(query);
         JsonNode ownLimit = modifier.get(FIELD_LIMIT);
@@ -2052,11 +2056,18 @@ public class Transformations {
         if (ownLimit == null || ownLimit.isNull() || isNullConstant(ownLimit)) {
             return;
         }
-        if (literalIntOf(ownLimit) == null) {
+        Long literal = literalIntOf(ownLimit);
+        if (literal == null) {
             throw new IllegalArgumentException(
                     "the query's LIMIT must be an integer literal when a row cap or offset "
-                    + "applies; an expression, scalar subquery or bind parameter cannot be "
-                    + "bounded reliably. Use a literal LIMIT instead.");
+                    + "applies; an expression, scalar subquery, bind parameter or non-integer "
+                    + "literal cannot be bounded reliably. Use a literal integer LIMIT instead.");
+        }
+        if (literal < 0) {
+            // DuckDB folds "LIMIT -1" into a constant, so it reaches here and would otherwise be
+            // reported as an offset problem by rejectOffsetPastOwnLimit.
+            throw new IllegalArgumentException(
+                    "the query's LIMIT must not be negative, got " + literal + ".");
         }
     }
 
@@ -2069,10 +2080,10 @@ public class Transformations {
             return;
         }
         Long literal = literalIntOf(ownLimit);
-        if (literal != null && offset >= literal) {
+        if (literal != null && offset > literal) {
             throw new IllegalArgumentException(
-                    "'offset' " + offset + " is at or past the query's own LIMIT " + literal
-                    + ", so that page is empty. Lower the offset or raise the query's LIMIT.");
+                    "'offset' " + offset + " is past the query's own LIMIT " + literal
+                    + ". Lower the offset or raise the query's LIMIT.");
         }
     }
 
@@ -2161,9 +2172,20 @@ public class Transformations {
     }
 
     /**
+     * DuckDB {@code type.id} values whose serialized constant is a plain integer. Anything else -
+     * DECIMAL, DOUBLE, FLOAT - is <b>not</b> read as a literal, because DuckDB serializes a
+     * DECIMAL as its <i>unscaled</i> integer plus a scale in {@code type_info}: {@code LIMIT 10.9}
+     * arrives as {@code 109}, and reading that as 10.9 rows would widen the query's own bound by
+     * 10^scale - the very bug this class now guards against.
+     */
+    private static final Set<String> INTEGER_CONSTANT_TYPE_IDS = Set.of(
+            "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT",
+            "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "UHUGEINT");
+
+    /**
      * The value of a LIMIT/OFFSET expression when it is an integer literal, else {@code null} (an
-     * expression, bind parameter, or NULL) - i.e. when it cannot be folded in Java and must be
-     * combined with {@code least} / {@code add} instead.
+     * expression, bind parameter, NULL, or a non-integer numeric type) - i.e. when it cannot be
+     * folded in Java, and so is rejected or composed at execution time instead.
      */
     private static Long literalIntOf(JsonNode node) {
         if (node == null || node.isNull()
@@ -2172,6 +2194,9 @@ public class Transformations {
         }
         JsonNode value = node.get(FIELD_VALUE);
         if (value == null || value.path(FIELD_IS_NULL).asBoolean(false)) {
+            return null;
+        }
+        if (!INTEGER_CONSTANT_TYPE_IDS.contains(value.path(FIELD_TYPE).path(FIELD_ID).asText())) {
             return null;
         }
         JsonNode inner = value.get(FIELD_VALUE);
