@@ -46,6 +46,17 @@ public class PruneUnusedLeftJoinsDuckLakeTest {
             "LEFT JOIN " + CATALOG + ".dim_a a ON f.a_id = a.a_id " +
             "LEFT JOIN " + CATALOG + ".dim_b b ON f.b_id = b.b_id";
 
+    // Same view body, but the fact reference carries a DuckLake time-travel clause defaulting to
+    // now() (the snapshot-aware read view proposed for classic-search v2). The AT lives on the
+    // retained fact ref, so join elimination must preserve it — dropping it would silently ignore a
+    // pinned snapshot; keeping all joins (bailing) is safe but unoptimized.
+    private static final String VIEW_BODY_AT =
+            "SELECT f.rowid AS rid, f.f_id, f.f_col, a.a_name, b.b_name " +
+            "FROM " + CATALOG + ".fact f " +
+            "AT (TIMESTAMP => COALESCE(TRY_CAST(getvariable('cs2_as_of') AS TIMESTAMPTZ), now())) " +
+            "LEFT JOIN " + CATALOG + ".dim_a a ON f.a_id = a.a_id " +
+            "LEFT JOIN " + CATALOG + ".dim_b b ON f.b_id = b.b_id";
+
     @BeforeAll
     static void setup() throws SQLException {
         String ws = WORKSPACE.toString();
@@ -61,11 +72,13 @@ public class PruneUnusedLeftJoinsDuckLakeTest {
         exec("CREATE TABLE " + CATALOG + ".dim_b(b_id INT, b_name VARCHAR)");
         exec("INSERT INTO " + CATALOG + ".dim_b VALUES (100,'b100')");
         exec("CREATE VIEW fv_dl AS " + VIEW_BODY);
+        exec("CREATE VIEW fv_dl_at AS " + VIEW_BODY_AT);
     }
 
     @AfterAll
     static void tearDown() throws SQLException {
         exec("DROP VIEW IF EXISTS fv_dl");
+        exec("DROP VIEW IF EXISTS fv_dl_at");
         exec("DETACH " + CATALOG);
         conn.close();
     }
@@ -139,6 +152,34 @@ public class PruneUnusedLeftJoinsDuckLakeTest {
 
         assertEquals(0, countJoins(pruned), "both dimension joins should be eliminated");
         assertEquivalentToView(pruned, outer);
+    }
+
+    @Test
+    void atTimeTravel_preservedAfterJoinElimination() throws Exception {
+        // Prune the AT-carrying view: only dim_a is used, so dim_b's join should go — but the
+        // fact's AT(TIMESTAMP => …) clause must survive on the retained fact reference.
+        String outer = "SELECT rid, a_name FROM fv_dl_at";
+        JsonNode body = Transformations.parseToTree(conn, VIEW_BODY_AT);
+        JsonNode pruned = Transformations.pruneUnusedLeftJoins(
+                Transformations.parseToTree(conn, outer), body);
+
+        String prunedSql = Transformations.parseToSql(conn, pruned);
+        String lower = prunedSql.toLowerCase();
+
+        // 1. The join was actually eliminated (prune did not bail on the AT clause).
+        assertEquals(1, countJoins(pruned),
+                "unused dim_b join should be eliminated even with an AT clause on the fact");
+        assertEquals(false, lower.contains("b_name"), "dim_b projection should be gone");
+
+        // 2. The critical assertion: the time-travel clause survived — dropping it would silently
+        //    read the latest snapshot instead of the pinned one.
+        org.junit.jupiter.api.Assertions.assertTrue(
+                lower.contains("getvariable") && (lower.contains(" at ") || lower.contains("timestamp")),
+                "AT(TIMESTAMP => …) must be preserved in the pruned SQL, got: " + prunedSql);
+
+        // 3. It still binds + executes (variable unset → now() → latest → all three fact rows).
+        List<List<Object>> rows = execRows(prunedSql);
+        assertEquals(3, rows.size());
     }
 
     @Test
